@@ -36,6 +36,7 @@ use ironclaw_host_api::{
     MountAlias, MountGrant, MountPermissions, MountView, RuntimeHttpEgressRequest, VirtualPath,
 };
 use ironclaw_llm::Role;
+use ironclaw_network::NetworkHttpRequest;
 use ironclaw_product_adapters::{ProductInboundAck, ProductTriggerReason, ProductWorkflow};
 use ironclaw_product_workflow::{
     DefaultProductWorkflow, ProductConversationRouteKind, ResolveBindingRequest, ResolvedBinding,
@@ -106,6 +107,13 @@ enum RebornCapabilityBackend {
     /// Uses `LoopbackMcpRuntimeHttpEgress` which makes real HTTP connections to
     /// the mock server; no real credentials or network policy are required.
     MockMcp { mcp_url: String },
+    /// GitHub first-party WASM capabilities with a `GithubHarnessAuthorizer`
+    /// that attaches an `InjectCredentialAccountOnce` obligation, so a dispatched
+    /// `github.*` tool call gets a synthetic access token injected onto the
+    /// outbound request (T0-SECRET-INJECT). The credential lands on the recorded
+    /// **network** egress (`assert_network_egress_header_contains`); the runtime
+    /// egress recorder is inert for this wiring — see that assertion's docs.
+    GithubIssueTools,
 }
 
 /// Builder for [`RebornIntegrationHarness`]. The script is fixed at build time
@@ -213,6 +221,23 @@ impl RebornIntegrationHarnessBuilder {
         self
     }
 
+    /// Wire the GitHub first-party WASM capabilities behind a
+    /// `GithubHarnessAuthorizer`, which allows every dispatch with an
+    /// `InjectCredentialAccountOnce` obligation. A scripted `github.*` tool call
+    /// then executes the real WASM module, whose outbound HTTP request has a
+    /// synthetic `Authorization: Bearer <token>` credential injected by the host
+    /// egress pipeline before it reaches the recording network egress. Proves
+    /// credential injection reaches the wire (T0-SECRET-INJECT).
+    ///
+    /// Script the model with
+    /// `RebornScriptedReply::tool_call("github.get_repo", json!({"owner": ..., "repo": ...}))`
+    /// followed by a `RebornScriptedReply::text(..)` turn, then assert with
+    /// [`assert_network_egress_header_contains`](RebornIntegrationHarness::assert_network_egress_header_contains).
+    pub fn with_github_issue_tools(mut self) -> Self {
+        self.capability = RebornCapabilityBackend::GithubIssueTools;
+        self
+    }
+
     /// Wire the real MCP runtime backed by a loopback mock MCP server (slice 6).
     ///
     /// `mcp_url` is the full mock endpoint URL (e.g. `server.mcp_url()`). The
@@ -276,6 +301,13 @@ impl RebornIntegrationHarnessBuilder {
                 .await?;
                 GroupCapability::HostRuntime(Arc::new(host_runtime))
             }
+            RebornCapabilityBackend::GithubIssueTools => {
+                // T0-SECRET-INJECT: GitHub WASM caps behind `GithubHarnessAuthorizer`
+                // (InjectCredentialAccountOnce). No approval gate / user alignment —
+                // the authorizer allows every dispatch outright.
+                let host_runtime = HostRuntimeCapabilityHarness::github_issue_tools().await?;
+                GroupCapability::HostRuntime(Arc::new(host_runtime))
+            }
         };
 
         // Routed through the group/thread builder (one assembly path for both
@@ -332,6 +364,8 @@ pub struct RebornIntegrationHarness {
     pub(crate) baseline_result_count: usize,
     /// Recorded-process-command count at harness construction. See `baseline_invocation_count`.
     pub(crate) baseline_process_count: usize,
+    /// Network-egress-request count at harness construction. See `baseline_invocation_count`.
+    pub(crate) baseline_network_count: usize,
 }
 
 impl RebornIntegrationHarness {
@@ -560,6 +594,16 @@ impl RebornIntegrationHarness {
             .filter(|message| matches!(message.role, Role::System))
             .map(|message| message.content)
             .collect()
+    }
+
+    /// Snapshot of the captured **network** egress requests for this thread only
+    /// (`[baseline_network_count..]` delta), in call order. Read by
+    /// `assert_network_egress_header_contains` (assertions.rs) — the T0-SECRET-INJECT
+    /// credential-injection assertion, which observes a different recorder lane
+    /// than `captured_egress_requests` (see that assertion's docs for why).
+    pub(super) fn captured_network_requests(&self) -> Vec<NetworkHttpRequest> {
+        let mut all = self.capability_recorder.network_http_requests();
+        all.split_off(self.baseline_network_count)
     }
 
     /// Assert that a `builtin.shell` command was recorded by the inert process
