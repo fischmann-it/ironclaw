@@ -231,6 +231,10 @@ impl RebornIntegrationHarnessBuilder {
             }
         };
 
+        // Routed through the group/thread builder (one assembly path for both
+        // groups and single-shot harnesses). A single-shot harness is a
+        // degenerate one-thread group and submits as the default
+        // `HARNESS_ACTOR_ID`.
         let group: RebornIntegrationGroup = RebornIntegrationGroup::builder()
             .storage(self.storage)
             .build_with_capability(group_capability)
@@ -341,6 +345,26 @@ impl RebornIntegrationHarness {
             .ok_or("blocked approval run missing gate ref")?;
         if !gate_ref.as_str().starts_with("gate:approval-") {
             return Err(format!("expected a local-dev approval gate, got {gate_ref:?}").into());
+        }
+        Ok((run_id, gate_ref))
+    }
+
+    /// Submit a user turn and wait until it blocks on an **auth** gate, returning
+    /// the run id and the raised `GateRef`. Mirror of `submit_turn_until_blocked`
+    /// for the `RebornIntegrationGroup::live_auth_gate` fixture: a scripted
+    /// capability whose credential account resolves to `AuthRequired` blocks here
+    /// at `TurnStatus::BlockedAuth` (E-AUTHGATE seam).
+    pub async fn submit_turn_until_auth_blocked(
+        &self,
+        text: &str,
+    ) -> HarnessResult<(TurnRunId, GateRef)> {
+        let run_id = self.submit_turn_async(text).await?;
+        let state = self
+            .wait_for_status(run_id, TurnStatus::BlockedAuth)
+            .await?;
+        let gate_ref = state.gate_ref.ok_or("blocked auth run missing gate ref")?;
+        if !gate_ref.as_str().starts_with("gate:auth-") {
+            return Err(format!("expected an auth gate ref, got {gate_ref:?}").into());
         }
         Ok((run_id, gate_ref))
     }
