@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use ironclaw_extensions::ExtensionInstallationStore;
 use ironclaw_filesystem::{
     CompositeRootFilesystem, InMemoryBackend, LibSqlRootFilesystem, ScopedFilesystem,
 };
@@ -43,9 +44,10 @@ use ironclaw_product_workflow::{
 };
 use ironclaw_threads::ThreadScope;
 use ironclaw_turns::{
-    FilesystemTurnStateStore, GateRef, GateResumeDisposition, GetRunStateRequest, IdempotencyKey,
-    ReplyTargetBindingRef, ResumeTurnPrecondition, ResumeTurnRequest, SourceBindingRef, TurnActor,
-    TurnCoordinator, TurnRunId, TurnRunState, TurnScope, TurnStateStore, TurnStatus,
+    CancelRunRequest, CancelRunResponse, FilesystemTurnStateStore, GateRef, GateResumeDisposition,
+    GetRunStateRequest, IdempotencyKey, ReplyTargetBindingRef, ResumeTurnPrecondition,
+    ResumeTurnRequest, SanitizedCancelReason, SourceBindingRef, TurnActor, TurnCoordinator,
+    TurnRunId, TurnRunState, TurnScope, TurnStateStore, TurnStatus,
 };
 
 use super::group::{GroupCapability, GroupSharedStorage, RebornIntegrationGroup};
@@ -56,6 +58,7 @@ use super::harness::{
 use super::http_matcher::ScriptedHttpResponse;
 use super::process::ScriptedProcessResult;
 use super::reply::RebornScriptedReply;
+use super::scripted_provider::ParkingModelGate;
 use super::session_thread::RebornThreadHarness;
 use super::test_adapter::RebornTestIngress;
 use crate::support::trace_llm::TraceLlm;
@@ -130,6 +133,9 @@ pub struct RebornIntegrationHarnessBuilder {
     /// construction — the last shell-selecting builder method wins, and a live
     /// runtime can never carry a stale scripted result.
     shell_mode: ShellMode,
+    /// E-GATEWAY: when set, the model call parks until released, enabling a
+    /// mid-turn cancel test. Threaded into the degenerate one-thread group.
+    park_gate: Option<ParkingModelGate>,
 }
 
 /// Which process port the built `BuiltinHttpTools` runtime installs for
@@ -160,6 +166,14 @@ impl RebornIntegrationHarnessBuilder {
     /// test on-disk durability via `assert_reply_persists_after_reopen`.
     pub fn storage(mut self, mode: StorageMode) -> Self {
         self.storage = mode;
+        self
+    }
+
+    /// Park this harness's model call until `gate` is released (E-GATEWAY seam),
+    /// so a test can cancel the run mid-turn. See
+    /// [`RebornThreadBuilder::park_model`].
+    pub fn park_model(mut self, gate: ParkingModelGate) -> Self {
+        self.park_gate = Some(gate);
         self
     }
 
@@ -321,6 +335,7 @@ impl RebornIntegrationHarnessBuilder {
         group
             .thread(self.conversation_id)
             .script(self.replies)
+            .park_model_opt(self.park_gate)
             .build()
             .await
     }
@@ -344,9 +359,14 @@ pub struct RebornIntegrationHarness {
     pub(crate) capability_recorder: HarnessCapabilityRecorder,
     /// The concrete scripted `TraceLlm` retained before it was upcast to
     /// `dyn LlmProvider` in the per-thread gateway build. Its
-    /// `captured_requests()` lets assertions inspect the model-visible prompt
-    /// (system-prompt injection: safety banners, skill instructions, profile
-    /// lines). Read via `captured_system_prompts()`.
+    /// `captured_requests()` lets assertions inspect the exact model-visible
+    /// requests: the system prompt (safety banners, profile lines —
+    /// `captured_system_prompts()`/`assert_system_prompt_contains`) and any
+    /// host-injected context such as activated-skill instructions
+    /// (`assert_model_request_contains`, E-SKILL half B). Retained even when
+    /// the thread parks the model (`park_model`, E-GATEWAY): parking mode is
+    /// only a wrapper (`ParkingLlm`) around this SAME `TraceLlm`, so captured
+    /// requests are still inspectable for a parked thread.
     pub(crate) scripted_llm: Arc<TraceLlm>,
     /// Shared storage bundle keeping the composite, TempDir, product harness, and
     /// capability alive for this harness's lifetime. For a single-shot harness the
@@ -383,6 +403,7 @@ impl RebornIntegrationHarness {
             keyed_http_responses: Vec::new(),
             storage: StorageMode::default(),
             shell_mode: ShellMode::default(),
+            park_gate: None,
         }
     }
 
@@ -524,6 +545,44 @@ impl RebornIntegrationHarness {
                 .await
                 .map_err(Into::into)
         }
+    }
+
+    /// E-DURABLE: assert an installed extension survives an independent reopen
+    /// of the capability composite. Opens a FRESH `ExtensionInstallationStore`
+    /// at the capability harness's on-disk `storage_root` (a handle independent
+    /// of the live `Arc`) and asserts `extension_id` is present — proving the
+    /// install persisted to disk, not just to in-memory state. Parallels
+    /// `assert_reply_persists_after_reopen` for capability-produced state.
+    pub async fn assert_extension_install_persists_after_reopen(
+        &self,
+        extension_id: &str,
+    ) -> HarnessResult<()> {
+        let harness = match &self._shared.capability {
+            GroupCapability::HostRuntime(arc) => arc,
+            GroupCapability::Recording => {
+                return Err("no host-runtime capability backend for durable reopen".into());
+            }
+        };
+        let store =
+            ironclaw_reborn_composition::test_support::open_local_dev_extension_installation_store_for_test(
+                &harness.storage_root_for_test(),
+            )
+            .await?;
+        let installations = store.list_installations().await?;
+        if installations
+            .iter()
+            .any(|installation| installation.extension_id().as_str() == extension_id)
+        {
+            return Ok(());
+        }
+        let seen: Vec<&str> = installations
+            .iter()
+            .map(|installation| installation.extension_id().as_str())
+            .collect();
+        Err(
+            format!("extension {extension_id:?} not found after independent reopen; saw {seen:?}")
+                .into(),
+        )
     }
 
     /// Assert the named capability was invoked through the real capability path
@@ -818,6 +877,22 @@ impl RebornIntegrationHarness {
             return Err(format!("expected resumed run to queue, got {:?}", response.status).into());
         }
         Ok(())
+    }
+
+    /// Request cancellation of an in-flight run (E-GATEWAY seam). Mirrors
+    /// `resume_run`'s coordinator-call shape; drives the mid-turn cancel path so
+    /// a parked model call can be cancelled and the run reaches `Cancelled`.
+    pub async fn cancel_run(&self, run_id: TurnRunId) -> HarnessResult<CancelRunResponse> {
+        self.coordinator
+            .cancel_run(CancelRunRequest {
+                scope: self.turn_scope.clone(),
+                actor: TurnActor::new(self.binding.actor_user_id.clone()),
+                run_id,
+                reason: SanitizedCancelReason::UserRequested,
+                idempotency_key: IdempotencyKey::new(format!("cancel-{run_id}"))?,
+            })
+            .await
+            .map_err(Into::into)
     }
 }
 
