@@ -107,7 +107,7 @@ use crate::default_system_prompt::DefaultSystemPromptIdentitySource;
 use crate::factory::{LocalDevRootFilesystem, LocalDevTurnStateStore, builtin_extension_registry};
 use crate::local_dev_capability_policy::{LocalDevCapabilityPolicy, local_dev_capability_policy};
 #[cfg(any(test, feature = "test-support"))]
-use crate::outbound::OutboundDeliveryTargetEntry;
+use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
 use crate::outbound::{
     MutableOutboundDeliveryTargetRegistry, OUTBOUND_DELIVERY_TARGET_SET_CAPABILITY_ID,
     OutboundDeliveryTargetProvider, OutboundDeliveryTargetRegistrationOutcome,
@@ -3234,7 +3234,6 @@ pub async fn build_reborn_runtime(
         let local_dev_capabilities = local_dev::capability_wiring(
             &services,
             Arc::clone(&thread_service) as Arc<dyn SessionThreadService>,
-            thread_scope.clone(),
             actor_user_id.clone(),
             Arc::clone(&local_dev_capability_policy),
             model_gateway,
@@ -4494,6 +4493,15 @@ output_schema_ref = "schemas/write.output.json"
                 &self,
                 _request: GetRunStateRequest,
             ) -> Result<ironclaw_turns::TurnRunState, ironclaw_turns::TurnError> {
+                unimplemented!(
+                    "no local-dev runtime: neither accessor should reach the coordinator"
+                )
+            }
+
+            async fn retry_turn(
+                &self,
+                _request: ironclaw_turns::RetryTurnRequest,
+            ) -> Result<ironclaw_turns::RetryTurnResponse, ironclaw_turns::TurnError> {
                 unimplemented!(
                     "no local-dev runtime: neither accessor should reach the coordinator"
                 )
