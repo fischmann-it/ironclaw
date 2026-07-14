@@ -1450,6 +1450,8 @@ async fn tool_response_to_host(
             .with_usage(LoopModelUsage {
                 input_tokens: response.input_tokens,
                 output_tokens: response.output_tokens,
+                cache_read_input_tokens: response.cache_read_input_tokens,
+                cache_creation_input_tokens: response.cache_creation_input_tokens,
             }));
         }
         let advertised_tool_names = capabilities
@@ -1533,6 +1535,8 @@ async fn tool_response_to_host(
         .with_usage(LoopModelUsage {
             input_tokens: response.input_tokens,
             output_tokens: response.output_tokens,
+            cache_read_input_tokens: response.cache_read_input_tokens,
+            cache_creation_input_tokens: response.cache_creation_input_tokens,
         }));
     }
 
@@ -1556,6 +1560,8 @@ async fn tool_response_to_host(
             .with_usage(LoopModelUsage {
                 input_tokens: response.input_tokens,
                 output_tokens: response.output_tokens,
+                cache_read_input_tokens: response.cache_read_input_tokens,
+                cache_creation_input_tokens: response.cache_creation_input_tokens,
             }))
         }
         FinishReason::Length => Err(HostManagedModelError::safe(
@@ -1874,6 +1880,8 @@ fn response_to_host_reply(
     let usage = LoopModelUsage {
         input_tokens: response.input_tokens,
         output_tokens: response.output_tokens,
+        cache_read_input_tokens: response.cache_read_input_tokens,
+        cache_creation_input_tokens: response.cache_creation_input_tokens,
     };
     match response.finish_reason {
         FinishReason::Stop => {
