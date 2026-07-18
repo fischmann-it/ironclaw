@@ -59,12 +59,10 @@ const FROZEN_INMEMORY_STORES: &[&str] = &[
     // --- peripheral stores (outside §4.3's five core domains; listed so the
     //     ratchet stays exhaustive and no new InMemory store slips in) ---
     "InMemoryBoundedSubagentGoalStore",
-    "InMemoryDeliveredGateRouteStore",
     "InMemoryExtensionInstallationStore",
     "InMemoryOpenAiCompatRefStore",
     "InMemorySecretStore",
     "InMemorySessionStore",
-    "InMemoryTriggeredRunDeliveryStore",
     // --- pub(crate) stores the visibility-aware scanner also inventories
     //     (same debt class, just crate-private) ---
     "InMemorySecretsStore",
