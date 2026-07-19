@@ -107,6 +107,7 @@ use ironclaw_turns::run_profile::UserProfileContext;
 use self::latency::{trace_runtime_latency_error, trace_runtime_latency_ok};
 use self::runtime_turn_scheduler::RuntimeTurnScheduler;
 use crate::builtin_capability_policy::{BuiltinCapabilityPolicy, builtin_capability_policy};
+use crate::deployment::{DeploymentConfig, RuntimeSubstrate, TrafficPolicy};
 use crate::factory::{ComposedTurnStateStore, builtin_extension_registry};
 #[cfg(any(test, feature = "test-support"))]
 use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
@@ -148,9 +149,15 @@ use crate::runtime_input::{
     TriggerPollerSettings,
 };
 use crate::{
-    RebornBuildError, RebornCompositionProfile, RebornProductAuthServices, RebornReadiness,
-    RebornReadinessState, RebornServices, build_reborn_services,
+    RebornBuildError, RebornProductAuthServices, RebornReadiness, RebornServices,
+    build_reborn_services,
 };
+// Only `check_production_scheduler_wake_wiring` (cfg libsql/postgres) still
+// names the profile type directly now that live-traffic admission reads the
+// DeploymentConfig; gate the import to match so the default lane sees no unused
+// import.
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+use crate::RebornCompositionProfile;
 use production::{
     EmptyCapabilitySurfaceResolver, EmptyIdentityContextSource,
     UnavailableApprovalInteractionService, UnavailableCapabilityIo,
@@ -404,66 +411,50 @@ where
     }
 }
 
+/// Gate live-traffic startup on the deployment's [`TrafficPolicy`].
+///
+/// §4.4: this used to be a seven-arm `match` on the composition profile, with
+/// each arm spelling out its own readiness precondition. The precondition is
+/// now data on the config — a required readiness state plus an optional
+/// production-blocking-diagnostic veto — so this reads one value. The profile
+/// still appears in the error text, as a label for the operator.
 fn enforce_runtime_cutover_gate(
-    profile: RebornCompositionProfile,
+    deployment: &DeploymentConfig,
     readiness: &RebornReadiness,
 ) -> Result<(), RebornRuntimeError> {
-    match profile {
-        RebornCompositionProfile::Production => {
-            if readiness.state != RebornReadinessState::ProductionValidated {
-                return Err(RebornRuntimeError::InvalidArgument {
-                    reason: format!(
-                        "profile=production cannot start Reborn runtime before production readiness is validated; state={:?}",
-                        readiness.state
-                    ),
-                });
-            }
-            if let Some(diagnostic) = readiness
+    let profile = deployment.profile();
+    let traffic = deployment.traffic();
+    if let Some(reason) = traffic.live_traffic_refusal(profile) {
+        return Err(RebornRuntimeError::InvalidArgument { reason });
+    }
+    if let TrafficPolicy::Serve {
+        required_readiness,
+        veto_on_production_blocking_diagnostic,
+    } = traffic
+    {
+        if readiness.state != required_readiness {
+            return Err(RebornRuntimeError::InvalidArgument {
+                reason: format!(
+                    "profile={profile} cannot start Reborn runtime before readiness is validated; required_state={required_readiness:?}, state={:?}",
+                    readiness.state
+                ),
+            });
+        }
+        if veto_on_production_blocking_diagnostic
+            && let Some(diagnostic) = readiness
                 .diagnostics
                 .iter()
                 .find(|diagnostic| diagnostic.blocks_production)
-            {
-                return Err(RebornRuntimeError::InvalidArgument {
-                    reason: format!(
-                        "profile=production cannot start Reborn runtime while readiness diagnostic blocks production: component={:?}, reason={:?}",
-                        diagnostic.component, diagnostic.reason
-                    ),
-                });
-            }
-            Ok(())
+        {
+            return Err(RebornRuntimeError::InvalidArgument {
+                reason: format!(
+                    "profile={profile} cannot start Reborn runtime while readiness diagnostic blocks production: component={:?}, reason={:?}",
+                    diagnostic.component, diagnostic.reason
+                ),
+            });
         }
-        RebornCompositionProfile::MigrationDryRun => Err(RebornRuntimeError::InvalidArgument {
-            reason:
-                "profile=migration-dry-run validates production-shaped wiring but must not start live Reborn runtime traffic"
-                    .to_string(),
-        }),
-        RebornCompositionProfile::Disabled => Err(RebornRuntimeError::InvalidArgument {
-            reason: "profile=disabled must not start live Reborn runtime traffic".to_string(),
-        }),
-        RebornCompositionProfile::HostedSingleTenant => {
-            if readiness.state != RebornReadinessState::HostedSingleTenantValidated {
-                return Err(RebornRuntimeError::InvalidArgument {
-                    reason: format!(
-                        "profile=hosted-single-tenant cannot start Reborn runtime before hosted single-tenant readiness is validated; required_state=HostedSingleTenantValidated, state={:?}",
-                        readiness.state
-                    ),
-                });
-            }
-            Ok(())
-        }
-        RebornCompositionProfile::HostedSingleTenantVolume => {
-            if readiness.state != RebornReadinessState::HostedSingleTenantVolumePreviewValidated {
-                return Err(RebornRuntimeError::InvalidArgument {
-                    reason: format!(
-                        "profile=hosted-single-tenant-volume cannot start Reborn runtime before hosted volume preview readiness is validated; required_state=HostedSingleTenantVolumePreviewValidated, state={:?}",
-                        readiness.state
-                    ),
-                });
-            }
-            Ok(())
-        }
-        RebornCompositionProfile::LocalDev | RebornCompositionProfile::LocalDevYolo => Ok(()),
     }
+    Ok(())
 }
 
 /// Guard: production and migration-dry-run compositions always pre-mint
@@ -480,10 +471,8 @@ fn check_production_scheduler_wake_wiring(
     wiring: &Option<ironclaw_runner::runtime::SchedulerWakeWiring>,
 ) -> Result<(), RebornRuntimeError> {
     if wiring.is_none()
-        && matches!(
-            profile,
-            RebornCompositionProfile::Production | RebornCompositionProfile::MigrationDryRun
-        )
+        && DeploymentConfig::for_profile(profile, false).substrate()
+            == RuntimeSubstrate::ProductionShaped
     {
         return Err(RebornRuntimeError::InvalidArgument {
             reason: "production runtime missing scheduler wake wiring".to_string(),
@@ -758,16 +747,16 @@ impl RegistryPersistentApprovalGranteeResolver {
 /// test accessor: production wires one for audit-log observability only, not
 /// correctness the test needs. Propagates policy/resolver construction failures
 /// instead of collapsing them to `None`. Thin wrapper over
-/// `build_local_dev_approval_interaction_service_with_turn_run_source` using
+/// `build_approval_interaction_service_with_turn_run_source` using
 /// `local_runtime.turn_state` as the turn-run snapshot source — production
 /// behavior is unchanged by the seam below.
-pub(crate) fn build_local_dev_approval_interaction_service(
+pub(crate) fn build_approval_interaction_service(
     local_runtime: &crate::factory::RebornRuntimeSubstrate,
     builtin_capability_policy: Arc<BuiltinCapabilityPolicy>,
     turn_coordinator: Arc<dyn TurnCoordinator>,
     audit_sink: Option<Arc<dyn ironclaw_events::AuditSink>>,
 ) -> Result<Arc<dyn ApprovalInteractionService>, RebornRuntimeError> {
-    build_local_dev_approval_interaction_service_with_turn_run_source(
+    build_approval_interaction_service_with_turn_run_source(
         local_runtime,
         builtin_capability_policy,
         turn_coordinator,
@@ -776,17 +765,17 @@ pub(crate) fn build_local_dev_approval_interaction_service(
     )
 }
 
-/// Identical to [`build_local_dev_approval_interaction_service`]
+/// Identical to [`build_approval_interaction_service`]
 /// except the approval turn-run locator reads `turn_run_source` instead of
 /// always deriving it from `local_runtime.turn_state`. Lets a caller whose
 /// real runs live in a DIFFERENT `TurnStateStore` composition (e.g.
 /// `RebornIntegrationGroup`'s own `build_default_planned_runtime`, whose runs
 /// are invisible to this crate's `local_runtime.turn_state`) substitute its
-/// own store. `build_local_dev_approval_interaction_service` is the
+/// own store. `build_approval_interaction_service` is the
 /// production entry point and is a thin wrapper over this function with
 /// `local_runtime.turn_state` as the source, so production behavior is
 /// unchanged.
-pub(crate) fn build_local_dev_approval_interaction_service_with_turn_run_source(
+pub(crate) fn build_approval_interaction_service_with_turn_run_source(
     local_runtime: &crate::factory::RebornRuntimeSubstrate,
     builtin_capability_policy: Arc<BuiltinCapabilityPolicy>,
     turn_coordinator: Arc<dyn TurnCoordinator>,
@@ -1034,7 +1023,7 @@ struct SnapshotApprovalTurnRunLocator {
     /// A trait object (not the concrete `ComposedTurnStateStore`) so a
     /// caller can substitute a different turn-state store's snapshot view —
     /// see `turn_run_snapshot::TurnRunSnapshotSource` and
-    /// `build_local_dev_approval_interaction_service_with_turn_run_source`.
+    /// `build_approval_interaction_service_with_turn_run_source`.
     turn_state: Arc<dyn TurnRunSnapshotSource>,
 }
 
@@ -3142,22 +3131,12 @@ pub async fn build_reborn_runtime(
     })?;
 
     let profile = services_input.profile();
-    if !profile.starts_live_runtime() {
-        if profile == RebornCompositionProfile::MigrationDryRun {
-            return Err(RebornRuntimeError::InvalidArgument {
-                reason:
-                    "profile=migration-dry-run validates production-shaped wiring but must not start live Reborn runtime traffic"
-                        .to_string(),
-            });
-        }
-        if profile == RebornCompositionProfile::Disabled {
-            return Err(RebornRuntimeError::InvalidArgument {
-                reason: "profile=disabled must not start live Reborn runtime traffic".to_string(),
-            });
-        }
-        return Err(RebornRuntimeError::InvalidArgument {
-            reason: format!("profile={profile} must not start live Reborn runtime traffic"),
-        });
+    // The deployment this build assembles, as data (§4.4/§5.6). Every axis
+    // below — live-traffic admission, the cutover gate, substrate selection —
+    // reads a field on this value instead of re-matching the profile.
+    let deployment = services_input.deployment().clone();
+    if let Some(reason) = deployment.traffic().live_traffic_refusal(profile) {
+        return Err(RebornRuntimeError::InvalidArgument { reason });
     }
     // Capture the resolved policy before `build_reborn_services` consumes the
     // input. Downstream wiring selects enforcement behaviour from resolved
@@ -3234,7 +3213,7 @@ pub async fn build_reborn_runtime(
         )
         .await?;
     }
-    enforce_runtime_cutover_gate(profile, &services.readiness)?;
+    enforce_runtime_cutover_gate(&deployment, &services.readiness)?;
 
     // Extract the pre-minted scheduler wake wiring from the production composition path
     // (minted in `build_production_shaped`) so it can be handed to
@@ -3253,11 +3232,8 @@ pub async fn build_reborn_runtime(
     #[cfg(not(any(feature = "libsql", feature = "postgres")))]
     let production_scheduler_wake: Option<ironclaw_runner::runtime::SchedulerWakeWiring> = None;
 
-    let runtime_parts = match profile {
-        RebornCompositionProfile::LocalDev
-        | RebornCompositionProfile::LocalDevYolo
-        | RebornCompositionProfile::HostedSingleTenant
-        | RebornCompositionProfile::HostedSingleTenantVolume => {
+    let runtime_parts = match deployment.substrate() {
+        RuntimeSubstrate::Local => {
             let local_runtime =
                 services
                     .local_runtime
@@ -3268,7 +3244,7 @@ pub async fn build_reborn_runtime(
                     })?;
             local_runtime_parts(local_runtime)
         }
-        RebornCompositionProfile::Production => {
+        RuntimeSubstrate::ProductionShaped => {
             #[cfg(any(feature = "libsql", feature = "postgres"))]
             {
                 let production_runtime = services.production_runtime.as_ref().ok_or(
@@ -3295,7 +3271,17 @@ pub async fn build_reborn_runtime(
                 });
             }
         }
-        _ => unreachable!("unsupported runtime profile checked above"),
+        // `RuntimeSubstrate::None` never reaches here: the disabled
+        // deployment's traffic policy refuses live traffic before the services
+        // are built, and again at the cutover gate above.
+        RuntimeSubstrate::None => {
+            return Err(RebornRuntimeError::InvalidArgument {
+                reason: format!(
+                    "profile={} assembles no runtime substrate",
+                    deployment.profile()
+                ),
+            });
+        }
     };
     let RuntimeStoreParts {
         local_runtime,
@@ -3966,7 +3952,7 @@ pub async fn build_reborn_runtime(
         if let (Some(local_runtime), Some(builtin_capability_policy)) =
             (local_runtime, builtin_capability_policy)
         {
-            build_local_dev_approval_interaction_service(
+            build_approval_interaction_service(
                 local_runtime,
                 builtin_capability_policy,
                 Arc::clone(&planned_turn_coordinator),
@@ -4234,7 +4220,7 @@ fn build_webui_auth_interaction_service(
 /// Identical to [`build_webui_auth_interaction_service`] except
 /// the auth read model reads `turn_run_source` instead of a hardcoded
 /// `ComposedTurnStateStore`. See
-/// `build_local_dev_approval_interaction_service_with_turn_run_source`'s doc
+/// `build_approval_interaction_service_with_turn_run_source`'s doc
 /// for why this seam exists.
 fn build_webui_auth_interaction_service_with_turn_run_source(
     product_auth: Option<&RebornProductAuthServices>,
